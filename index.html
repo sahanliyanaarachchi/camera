@@ -82,9 +82,17 @@
     await uploadString(storageReference, imageData, 'data_url');
     const url = await getDownloadURL(storageReference);
 
+    // Update humanAlert node in Firebase
     await set(ref(db, "humanAlert"), {
       personDetected: true,
       imageUrl: url,
+      timestamp: new Date().toISOString()
+    });
+
+    // Update status node for alerts page
+    await set(ref(db, "humanAlert/status"), {
+      personDetected: true,
+      count: lastPersonCount,
       timestamp: new Date().toISOString()
     });
   }
