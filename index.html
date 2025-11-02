@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Thermal Vision - Human Detection</title>
+
+<!-- Firebase -->
+<script src="https://www.gstatic.com/firebasejs/10.14.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.0/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.0/firebase-storage-compat.js"></script>
+
+<!-- TensorFlow -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+
+<style>
+  body {
+    background: #000;
+    color: #0ff;
+    font-family: 'Orbitron', sans-serif;
+    text-align: center;
+    margin: 0;
+    padding: 10px;
+  }
+
+  h2 {
+    color: #00ffff;
+    text-shadow: 0 0 10px #0ff;
+  }
+
+  video, canvas {
+    border: 3px solid #00ffff;
+    border-radius: 10px;
+    width: 90%;
+    max-width: 720px;
+    margin-top: 10px;
+    box-shadow: 0 0 20px cyan;
+  }
+
+  #status {
+    margin-top: 15px;
+    font-size: 18px;
+    text-shadow: 0 0 10px #0ff;
+  }
+
+  #info {
+    margin-top: 10px;
+    font-size: 16px;
+    color: #8ff;
+  }
+
+  canvas {
+    filter: contrast(2) saturate(2);
+  }
+</style>
+</head>
+<body>
+<h2>🌡️ Thermal Vision - Human Detection</h2>
+<video id="video" autoplay muted playsinline></video>
+<canvas id="canvas"></canvas>
+<div id="status">Initializing...</div>
+<div id="info"></div>
+
+<script>
+  // 🔥 Firebase Config
+  const firebaseConfig = {
+    apiKey: "AIzaSyAASopq67qBAg2IoB7lfFsAbAFvfsbSwJA",
+    authDomain: "human-detect-19f4f.firebaseapp.com",
+    databaseURL: "https://human-detect-19f4f-default-rtdb.firebaseio.com",
+    projectId: "human-detect-19f4f",
+    storageBucket: "human-detect-19f4f.firebasestorage.app",
+    messagingSenderId: "281262323303",
+    appId: "1:281262323303:web:6fd0d706a4076d9cff06c2",
+    measurementId: "G-WB67N57RZ6"
+  };
+
+  firebase.initializeApp(firebaseConfig);
+  const db = firebase.database();
+  const storage = firebase.storage();
+
+  const video = document.getElementById("video");
+  const canvas = document.getElementById("canvas");
+  const ctx = canvas.getContext("2d");
+  const statusEl = document.getElementById("status");
+  const infoEl = document.getElementById("info");
+
+  let lastPersonCount = 0;
+  let lastUpdate = 0;
+  let frameCount = 0;
+  let lastFpsTime = performance.now();
+  let fps = 0;
+  let lastImageUpload = 0;
+
+  // 🎥 Start camera
+  async function startCamera() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false
+      });
+      video.srcObject = stream;
+      await new Promise(r => video.onloadedmetadata = r);
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      statusEl.textContent = "✅ Camera Active (Thermal Mode)";
+    } catch (err) {
+      statusEl.textContent = "❌ Camera access denied!";
+      console.error(err);
+    }
+  }
+
+  // 🌡️ Apply thermal color effect
+  function applyThermalEffect(imageData) {
+    const data = imageData.data;
+    for (let i = 0; i < data.length; i += 4) {
+      const brightness = (data[i] + data[i+1] + data[i+2]) / 3;
+      const t = brightness / 255;
+      const r = Math.min(255, 512 * (t - 0.5));
+      const g = Math.min(255, 512 * (0.5 - Math.abs(t - 0.5)));
+      const b = Math.min(255, 512 * (0.5 - t));
+      data[i] = Math.max(0, r);
+      data[i+1] = Math.max(0, g);
+      data[i+2] = Math.max(0, b);
+    }
+    return imageData;
+  }
+
+  // 📸 Capture and upload image
+  async function captureAndUpload() {
+    try {
+      const now = Date.now();
+      // avoid spamming uploads (limit to 1 every 10 seconds)
+      if (now - lastImageUpload < 10000) return;
+      lastImageUpload = now;
+
+      const imageData = canvas.toDataURL("image/jpeg");
+      const imageName = `capture_${new Date().toISOString().replace(/[:.]/g, '-')}.jpg`;
+      const storageRef = storage.ref(`captures/${imageName}`);
+      await storageRef.putString(imageData, 'data_url');
+      const url = await storageRef.getDownloadURL();
+
+      await db.ref("humanAlert").set({
+        personDetected: true,
+        imageUrl: url,
+        timestamp: new Date().toISOString()
+      });
+
+      console.log("📤 Image uploaded:", url);
+    } catch (err) {
+      console.error("Image upload failed:", err);
+    }
+  }
+
+  // 🔍 Detection loop
+  async function startDetection() {
+    const model = await cocoSsd.load();
+    statusEl.textContent = "Model Loaded - Detecting...";
+
+    async function detectFrame() {
+      const predictions = await model.detect(video);
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      // Thermal overlay
+      let frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      frame = applyThermalEffect(frame);
+      ctx.putImageData(frame, 0, 0);
+
+      let personCount = 0;
+      let avgScore = 0;
+
+      predictions.forEach(pred => {
+        if (pred.class === "person" && pred.score > 0.4) {
+          personCount++;
+          avgScore += pred.score;
+          const [x, y, w, h] = pred.bbox;
+          ctx.beginPath();
+          ctx.rect(x, y, w, h);
+          ctx.strokeStyle = "white";
+          ctx.lineWidth = 2;
+          ctx.stroke();
+          ctx.fillStyle = "white";
+          ctx.font = "16px Arial";
+          ctx.fillText(`Human ${Math.round(pred.score * 100)}%`, x, y - 5);
+        }
+      });
+
+      // FPS calculation
+      frameCount++;
+      const now = performance.now();
+      if (now - lastFpsTime > 1000) {
+        fps = frameCount;
+        frameCount = 0;
+        lastFpsTime = now;
+      }
+
+      // Firebase update and image capture
+      if (personCount > 0 && personCount !== lastPersonCount) {
+        await captureAndUpload();
+      }
+
+      if (personCount !== lastPersonCount || now - lastUpdate > 5000) {
+        db.ref("humanAlert/status").set({
+          personDetected: personCount > 0,
+          count: personCount,
+          timestamp: new Date().toISOString()
+        });
+        lastPersonCount = personCount;
+        lastUpdate = now;
+      }
+
+      statusEl.textContent = personCount > 0 ? "🟢 Human Detected" : "🔴 No Human";
+      infoEl.innerHTML = `Count: ${personCount} | FPS: ${fps} | Avg Confidence: ${(avgScore/personCount*100 || 0).toFixed(1)}%`;
+
+      requestAnimationFrame(detectFrame);
+    }
+
+    detectFrame();
+  }
+
+  startCamera().then(startDetection);
+</script>
+</body>
+</html>
